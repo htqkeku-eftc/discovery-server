@@ -30,9 +30,9 @@ type Lobby struct {
 	Metadata         any           `json:"metadata"`          // Arbitrary, user-defined storage
 	Peers            []*PeerObject `json:"peers"`             // List of peers in the lobby (shortcut for querying peers)
 
-	Password    string     `json:"-"` // Password for the lobby
-	Instance    *Instance  `json:"-"` // Pointer to the instance
-	*sync.Mutex `json:"-"` // Mutex for thread safety
+	Password   string     `json:"-"` // Password for the lobby
+	Instance   *Instance  `json:"-"` // Pointer to the instance
+	sync.Mutex `json:"-"` // Mutex for thread safety
 }
 
 type PeerObject struct {
@@ -89,7 +89,7 @@ func (l *Lobby) Remove(peer *duplex.Peer) {
 	if idx == -1 {
 		return
 	}
-	l.Instance.Members[l] = slices.Delete(peers, idx, 1)
+	l.Instance.Members[l] = slices.Delete(peers, idx, idx+1)
 }
 
 func (l *Lobby) PrecomputeTasks() {
@@ -109,7 +109,7 @@ func (l *Lobby) GetHost() {
 func (l *Lobby) GetPeers() {
 	l.Peers = make([]*PeerObject, len(l.Instance.Members[l]))
 	for i, peer := range l.Instance.Members[l] {
-		_, isHost, _ := l.Instance.GetState(peer, false, false, nil)
+		_, isHost, _ := l.Instance.getStateUnlocked(peer, false, false, nil, false)
 		l.Peers[i] = &PeerObject{
 			Username:    peer.GiveName(),
 			Designation: l.Instance.Designation,
@@ -294,11 +294,13 @@ func New(server_config *Config, duplex_config *duplex.Config) *Instance {
 	server.OnClose = func(peer *duplex.Peer) {
 
 		// Read name
-		name, name_set := peer.KeyStore["name"]
+		name, name_set := GetPeerKey(peer, "name")
 		if name_set {
 			if _n, ok := name.(string); ok {
+				server.Mutex.Lock()
 				delete(server.NameRegistry, _n)
 				delete(server.BridgeRegistry, _n)
+				server.Mutex.Unlock()
 			}
 		}
 
@@ -409,7 +411,10 @@ func New(server_config *Config, duplex_config *duplex.Config) *Instance {
 		}
 
 		// Get lobby
+		server.Mutex.Lock()
 		lobby, exists := server.Lobbies[AnyToString(target)]
+		server.Mutex.Unlock()
+
 		if !exists {
 			peer.Write(&duplex.TxPacket{
 				Packet: duplex.Packet{
@@ -538,7 +543,6 @@ func New(server_config *Config, duplex_config *duplex.Config) *Instance {
 			Password:         args.Password,
 			PasswordRequired: args.Password != "",
 			Metadata:         args.Metadata,
-			Mutex:            &sync.Mutex{},
 			Instance:         server,
 		}
 
@@ -547,7 +551,7 @@ func New(server_config *Config, duplex_config *duplex.Config) *Instance {
 		server.Hosts[lobby] = peer
 
 		// Set key
-		peer.KeyStore["lobby"] = args.LobbyID
+		SetPeerKey(peer, "lobby", args.LobbyID)
 
 		// Log
 		server.Logger.Info().Msgf("%s created %v", peer.GiveName(), args.LobbyID)
@@ -626,7 +630,10 @@ func New(server_config *Config, duplex_config *duplex.Config) *Instance {
 		}
 
 		// Check if a lobby entry exists
-		if _, exists := server.Lobbies[AnyToString(args.LobbyID)]; !exists {
+		server.Mutex.Lock()
+		lobby, exists := server.Lobbies[AnyToString(args.LobbyID)]
+		if !exists || lobby == nil {
+			server.Mutex.Unlock()
 			peer.Write(&duplex.TxPacket{
 				Packet: duplex.Packet{
 					Opcode:   "LOBBY_NOTFOUND",
@@ -637,18 +644,13 @@ func New(server_config *Config, duplex_config *duplex.Config) *Instance {
 			return
 		}
 
-		// Get lobby
-		lobby := server.Lobbies[AnyToString(args.LobbyID)]
-		if lobby == nil {
-			panic("lobby is nil, despite previous validation check passing")
-		}
-
 		// Obtain lock
 		lobby.Lock()
 		defer lobby.Unlock()
 
 		// Check if locked
 		if lobby.Locked {
+			server.Mutex.Unlock()
 			peer.Write(&duplex.TxPacket{
 				Packet: duplex.Packet{
 					Opcode:   "LOBBY_LOCKED",
@@ -661,6 +663,7 @@ func New(server_config *Config, duplex_config *duplex.Config) *Instance {
 
 		// Validate current count and state
 		if lobby.MaxPeers != -1 && int64(len(server.Members[lobby])) >= lobby.MaxPeers {
+			server.Mutex.Unlock()
 			peer.Write(&duplex.TxPacket{
 				Packet: duplex.Packet{
 					Opcode:   "LOBBY_FULL",
@@ -674,6 +677,7 @@ func New(server_config *Config, duplex_config *duplex.Config) *Instance {
 		// Validate password (if present)
 		if lobby.Password != "" {
 			if args.Password == "" {
+				server.Mutex.Unlock()
 
 				// Peer did not provide a password
 				peer.Write(&duplex.TxPacket{
@@ -686,6 +690,7 @@ func New(server_config *Config, duplex_config *duplex.Config) *Instance {
 				return
 
 			} else if args.Password != lobby.Password {
+				server.Mutex.Unlock()
 
 				// Password is incorrect
 				peer.Write(&duplex.TxPacket{
@@ -711,9 +716,13 @@ func New(server_config *Config, duplex_config *duplex.Config) *Instance {
 
 		// Add peer to lobby
 		server.Members[lobby] = append(server.Members[lobby], peer)
+		host := server.Hosts[lobby]
+		members := make([]*duplex.Peer, len(server.Members[lobby]))
+		copy(members, server.Members[lobby])
+		server.Mutex.Unlock()
 
 		// Set key
-		peer.KeyStore["lobby"] = args.LobbyID
+		SetPeerKey(peer, "lobby", args.LobbyID)
 
 		// Log
 		server.Logger.Info().Msgf("%s joined %v", peer.GiveName(), lobby)
@@ -738,7 +747,7 @@ func New(server_config *Config, duplex_config *duplex.Config) *Instance {
 		})
 
 		// Notify members
-		for _, p := range server.Members[lobby] {
+		for _, p := range members {
 			if p != peer {
 				go p.Write(&duplex.TxPacket{
 					Packet: duplex.Packet{
@@ -751,14 +760,15 @@ func New(server_config *Config, duplex_config *duplex.Config) *Instance {
 		}
 
 		// Notify host
-		host := server.Hosts[lobby]
-		go host.Write(&duplex.TxPacket{
-			Packet: duplex.Packet{
-				Opcode: "PEER_JOIN",
-				TTL:    1,
-			},
-			Payload: peer.GetPeerID(),
-		})
+		if host != nil {
+			go host.Write(&duplex.TxPacket{
+				Packet: duplex.Packet{
+					Opcode: "PEER_JOIN",
+					TTL:    1,
+				},
+				Payload: peer.GetPeerID(),
+			})
+		}
 	})
 
 	// LOBBY_LIST is a request for a list of lobbies.
@@ -1008,7 +1018,11 @@ func New(server_config *Config, duplex_config *duplex.Config) *Instance {
 		}
 
 		// Find peer based on name
+		server.Mutex.Lock()
 		target, ok := server.NameRegistry[query]
+		host := server.Hosts[lobby]
+		server.Mutex.Unlock()
+
 		if !ok {
 			peer.Write(&duplex.TxPacket{
 				Packet: duplex.Packet{
@@ -1043,14 +1057,15 @@ func New(server_config *Config, duplex_config *duplex.Config) *Instance {
 		}
 
 		// Notify host
-		host := server.Hosts[lobby]
-		go host.Write(&duplex.TxPacket{
-			Packet: duplex.Packet{
-				Opcode: "PEER_LEFT",
-				TTL:    1,
-			},
-			Payload: target.GetPeerID(),
-		})
+		if host != nil {
+			go host.Write(&duplex.TxPacket{
+				Packet: duplex.Packet{
+					Opcode: "PEER_LEFT",
+					TTL:    1,
+				},
+				Payload: target.GetPeerID(),
+			})
+		}
 
 		// Tell target they were kicked
 		target.Write(&duplex.TxPacket{
@@ -1173,7 +1188,10 @@ func New(server_config *Config, duplex_config *duplex.Config) *Instance {
 		}
 
 		// Find peer based on name
+		server.Mutex.Lock()
 		target, ok := server.NameRegistry[query]
+		server.Mutex.Unlock()
+
 		if !ok {
 			peer.Write(&duplex.TxPacket{
 				Packet: duplex.Packet{
@@ -1380,14 +1398,19 @@ func New(server_config *Config, duplex_config *duplex.Config) *Instance {
 		}
 
 		// Notify host
+		server.Mutex.Lock()
 		host := server.Hosts[lobby]
-		go host.Write(&duplex.TxPacket{
-			Packet: duplex.Packet{
-				Opcode: "PEER_LEFT",
-				TTL:    1,
-			},
-			Payload: peer.GetPeerID(),
-		})
+		server.Mutex.Unlock()
+
+		if host != nil {
+			go host.Write(&duplex.TxPacket{
+				Packet: duplex.Packet{
+					Opcode: "PEER_LEFT",
+					TTL:    1,
+				},
+				Payload: peer.GetPeerID(),
+			})
+		}
 
 		server.Logger.Info().Msgf("%s left %s", peer.GiveName(), lobby.ID)
 
@@ -1517,8 +1540,8 @@ func New(server_config *Config, duplex_config *duplex.Config) *Instance {
 		// Register peer
 		server.NameRegistry[username] = peer
 
-		// Obtain lock and set name
-		peer.KeyStore["name"] = username
+		// Set name
+		SetPeerKey(peer, "name", username)
 
 		// Return success
 		peer.Write(&duplex.TxPacket{
@@ -1568,8 +1591,8 @@ func (server *Instance) AutoRegister(peer *duplex.Peer, registry Registry) {
 	// Register peer
 	registry[username] = peer
 
-	// Obtain lock and set name
-	peer.KeyStore["name"] = username
+	// Set name
+	SetPeerKey(peer, "name", username)
 
 	// Return success
 	peer.Write(&duplex.TxPacket{
@@ -1783,11 +1806,19 @@ func (i *Instance) Run() {
 // If the peer is not in a lobby, it will send a "CONFIG_REQUIRED" packet to the peer.
 // If halt_if_fail is true, it will halt execution of the opcode handler if any state checks fail.
 func (i *Instance) GetState(p *duplex.Peer, emit_warn bool, halt_if_fail bool, packet *duplex.RxPacket) (*Lobby, bool, bool) {
+	return i.getStateUnlocked(p, emit_warn, halt_if_fail, packet, true)
+}
+
+func (i *Instance) getStateUnlocked(p *duplex.Peer, emit_warn bool, halt_if_fail bool, packet *duplex.RxPacket, lockLobby bool) (*Lobby, bool, bool) {
+
+	if p == nil {
+		return nil, false, halt_if_fail
+	}
 
 	// Get current lobby
-	lobby_id, ok := p.KeyStore["lobby"]
+	lobby_id, ok := GetPeerKey(p, "lobby")
 	if !ok {
-		if emit_warn {
+		if emit_warn && packet != nil {
 			p.Write(&duplex.TxPacket{
 				Packet: duplex.Packet{
 					Opcode:   "CONFIG_REQUIRED",
@@ -1799,9 +1830,12 @@ func (i *Instance) GetState(p *duplex.Peer, emit_warn bool, halt_if_fail bool, p
 		return nil, false, halt_if_fail
 	}
 
+	i.Mutex.Lock()
 	lobby := i.Lobbies[AnyToString(lobby_id)]
+	i.Mutex.Unlock()
+
 	if lobby == nil {
-		if emit_warn {
+		if emit_warn && packet != nil {
 			p.Write(&duplex.TxPacket{
 				Packet: duplex.Packet{
 					Opcode:   "CONFIG_REQUIRED",
@@ -1813,13 +1847,18 @@ func (i *Instance) GetState(p *duplex.Peer, emit_warn bool, halt_if_fail bool, p
 		return nil, false, halt_if_fail
 	}
 
-	// Obtain lock
-	lobby.Lock()
-	defer lobby.Unlock()
+	// Obtain lock if requested
+	if lockLobby {
+		lobby.Lock()
+		defer lobby.Unlock()
+	}
 
 	// Verify role as lobby host
+	i.Mutex.Lock()
 	is_host := (p == i.Hosts[lobby])
-	if !is_host && emit_warn {
+	i.Mutex.Unlock()
+
+	if !is_host && emit_warn && packet != nil {
 		p.Write(&duplex.TxPacket{
 			Packet: duplex.Packet{
 				Opcode:   "UNAUTHORIZED",
@@ -1831,6 +1870,31 @@ func (i *Instance) GetState(p *duplex.Peer, emit_warn bool, halt_if_fail bool, p
 	}
 
 	return lobby, is_host, false
+}
+
+func GetPeerKey(peer *duplex.Peer, key string) (any, bool) {
+	if peer == nil {
+		return nil, false
+	}
+	peer.KeyLock.Lock()
+	defer peer.KeyLock.Unlock()
+	if peer.KeyStore == nil {
+		return nil, false
+	}
+	val, ok := peer.KeyStore[key]
+	return val, ok
+}
+
+func SetPeerKey(peer *duplex.Peer, key string, val any) {
+	if peer == nil {
+		return
+	}
+	peer.KeyLock.Lock()
+	defer peer.KeyLock.Unlock()
+	if peer.KeyStore == nil {
+		peer.KeyStore = make(map[string]any)
+	}
+	peer.KeyStore[key] = val
 }
 
 func ValidateAnyType(name any) error {

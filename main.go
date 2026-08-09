@@ -5,21 +5,86 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/cloudlink-delta/discovery-server/server"
 	"github.com/cloudlink-delta/duplex"
-	"github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v4"
 	"github.com/rs/zerolog"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 )
 
+func parsePredisposedInstances(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	var list []string
+	if err := json.Unmarshal([]byte(raw), &list); err == nil && len(list) > 0 {
+		var result []string
+		for _, s := range list {
+			if trimmed := strings.TrimSpace(s); trimmed != "" {
+				result = append(result, trimmed)
+			}
+		}
+		return result
+	}
+
+	parts := strings.Split(raw, ",")
+	var result []string
+	for _, p := range parts {
+		if trimmed := strings.Trim(strings.TrimSpace(p), "'\"[]"); trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
+}
+
+func parseICEServers(raw string) []webrtc.ICEServer {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	var servers []webrtc.ICEServer
+	if err := json.Unmarshal([]byte(raw), &servers); err == nil && len(servers) > 0 {
+		return servers
+	}
+
+	var urlList []string
+	if err := json.Unmarshal([]byte(raw), &urlList); err == nil && len(urlList) > 0 {
+		var urls []string
+		for _, u := range urlList {
+			if trimmed := strings.TrimSpace(u); trimmed != "" {
+				urls = append(urls, trimmed)
+			}
+		}
+		if len(urls) > 0 {
+			return []webrtc.ICEServer{{URLs: urls}}
+		}
+	}
+
+	parts := strings.Split(raw, ",")
+	var urls []string
+	for _, p := range parts {
+		if trimmed := strings.Trim(strings.TrimSpace(p), "'\"[]"); trimmed != "" {
+			urls = append(urls, trimmed)
+		}
+	}
+	if len(urls) > 0 {
+		return []webrtc.ICEServer{{URLs: urls}}
+	}
+	return nil
+}
+
 func main() {
 
 	// CLI flags
 	pflag.Int("log-level", (int)(zerolog.InfoLevel), "Logging level to use. Acceptable values range from -1 to 7. (default: 1 \"Info\")")
-	pflag.String("config", "./config.json", "Path to JSON configuration file")
+	pflag.String("config", "", "Path to JSON configuration file, i.e. ~/config.json")
 	pflag.String("designation", "", "Globally unique designation (required)")
 
 	// Duplex lib flags
@@ -28,8 +93,8 @@ func main() {
 	pflag.Bool("session-secure", true, "Enable secure session server connections (required if session-hostname is set)")
 	pflag.Int("session-port", 443, "Port where the session server is listening (required if session-hostname is set)")
 	pflag.String("session-hostname", "peerjs.mikedev101.cc", "Hostname where the session server is listening")
-	pflag.String("ice-servers", "", "JSON-encoded array of ICE servers")
-	pflag.String("predisposed-instances", "[]", "JSON-encoded array of WebSocket URLs for instances to connect to on startup")
+	pflag.String("ice-servers", "", "Comma-separated list or JSON-encoded array of ICE server URLs")
+	pflag.String("predisposed-instances", "", "Comma-separated list or JSON-encoded array of instances to connect to on startup")
 	pflag.String("address", "127.0.0.1:3001", "Discovery server listener address")
 
 	// Parse command-line flags
@@ -88,19 +153,13 @@ func main() {
 	}
 
 	var iceServers []webrtc.ICEServer
-	if viper.IsSet("ice_servers") {
-		data, _ := json.Marshal(viper.Get("ice_servers"))
-		if err := json.Unmarshal(data, &iceServers); err != nil {
-			log.Fatalf("Failed to parse ice_servers from config: %v", err)
-		}
-		duplexCfg.ICEServers = iceServers
-	}
 	if iceFlag := viper.GetString("ice_servers_flag"); iceFlag != "" {
-		if err := json.Unmarshal([]byte(iceFlag), &iceServers); err != nil {
-			log.Fatalf("Failed to parse ice-servers flag: %v", err)
-		}
-		duplexCfg.ICEServers = iceServers
+		iceServers = parseICEServers(iceFlag)
+	} else if viper.IsSet("ice_servers") {
+		data, _ := json.Marshal(viper.Get("ice_servers"))
+		iceServers = parseICEServers(string(data))
 	}
+	duplexCfg.ICEServers = iceServers
 
 	// Verify loaded configuration
 	if serverCfg.Designation == "" {
@@ -118,15 +177,10 @@ func main() {
 	// Load predisposed instances if provided
 	var predisposedInstances []string
 	if predisposedFlag := viper.GetString("predisposed_instances_flag"); predisposedFlag != "" {
-		if err := json.Unmarshal([]byte(predisposedFlag), &predisposedInstances); err != nil {
-			log.Printf("Warning: Failed to parse predisposed-instances flag: %v", err)
-		}
-	}
-	if viper.IsSet("predisposed_instances") && len(predisposedInstances) == 0 {
+		predisposedInstances = parsePredisposedInstances(predisposedFlag)
+	} else if viper.IsSet("predisposed_instances") {
 		data, _ := json.Marshal(viper.Get("predisposed_instances"))
-		if err := json.Unmarshal(data, &predisposedInstances); err != nil {
-			log.Printf("Warning: Failed to parse predisposed_instances from config: %v", err)
-		}
+		predisposedInstances = parsePredisposedInstances(string(data))
 	}
 	if len(predisposedInstances) > 0 {
 		instance.Predisposed_Instances = predisposedInstances
